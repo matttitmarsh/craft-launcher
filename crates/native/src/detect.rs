@@ -8,6 +8,8 @@
 //!   installs.
 //! - FreeBSD: tarball installs and `/usr/local/bin/<app>`.
 
+use std::path::{Path, PathBuf};
+
 use artcraft_launcher_core::{CraftApp, InstallSource, Installed, version};
 
 use crate::manifest::Manifest;
@@ -86,6 +88,25 @@ pub(crate) fn appimage_version(name: &str, stems: &[&str]) -> Option<Option<Stri
     (parsed.kind == artcraft_launcher_core::PackageKind::AppImage && parsed.token.starts_with("linux-")).then_some(Some(parsed.version))
 }
 
+/// Who our Windows Installer packages name as their publisher.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PUBLISHER: &str = "Learning Machines LLC";
+
+/// Whether an uninstall entry's `DisplayName` and `Publisher` are `app`'s.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_installer_entry(app: &CraftApp, display_name: &str, publisher: &str) -> bool {
+    display_name == app.name && publisher == PUBLISHER
+}
+
+/// Where a Windows install of `app` may keep its exe, in the order to try: the entry's
+/// `InstallLocation`, then `<App>` under each Program Files root. Doesn't touch the disk.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exe_candidates(app: &CraftApp, location: Option<&Path>, program_files: &[PathBuf]) -> Vec<PathBuf> {
+    let exe = format!("{}.exe", app.id);
+    let dirs = location.map(Path::to_path_buf).into_iter().chain(program_files.iter().map(|root| root.join(app.name)));
+    dirs.map(|d| d.join(&exe)).collect()
+}
+
 #[cfg(target_os = "macos")]
 pub mod macos {
     use std::path::{Path, PathBuf};
@@ -132,7 +153,6 @@ pub mod windows {
     use super::*;
 
     const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
-    const PUBLISHER: &str = "Learning Machines LLC";
 
     /// An MSI install found in the registry.
     pub struct MsiInstall {
@@ -150,7 +170,7 @@ pub mod windows {
                 let Ok(key) = root.open_subkey_with_flags(&code, KEY_READ | flags) else { continue };
                 let name: String = key.get_value("DisplayName").unwrap_or_default();
                 let publisher: String = key.get_value("Publisher").unwrap_or_default();
-                if name != app.name || publisher != PUBLISHER || out.iter().any(|m: &MsiInstall| m.product_code == code) {
+                if !is_installer_entry(app, &name, &publisher) || out.iter().any(|m: &MsiInstall| m.product_code == code) {
                     continue;
                 }
                 let version = key.get_value::<String, _>("DisplayVersion").ok().and_then(|v| version::parse(&v));
@@ -182,13 +202,13 @@ pub mod windows {
                 }
             }
         }
-        let mut dirs: Vec<PathBuf> = location.into_iter().collect();
+        let mut roots = Vec::new();
         for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
             if let Some(pf) = std::env::var_os(var) {
-                dirs.push(PathBuf::from(pf).join(app.name));
+                roots.push(PathBuf::from(pf));
             }
         }
-        dirs.into_iter().map(|d| d.join(&exe)).find(|p| p.exists())
+        exe_candidates(app, location.as_deref(), &roots).into_iter().find(|p| p.exists())
     }
 
     pub fn detect(app: &CraftApp) -> Option<Installed> {
@@ -398,6 +418,8 @@ mod linux_tests {
 
 #[cfg(test)]
 mod tests {
+    use artcraft_launcher_core::SUITE;
+
     use super::*;
 
     #[test]
@@ -449,5 +471,43 @@ mod tests {
                 (gear.join("photocraft.appimage"), None),
             ]
         );
+    }
+
+    const LEARNING_MACHINES: &str = "Learning Machines LLC";
+
+    fn roots() -> Vec<PathBuf> {
+        vec![PathBuf::from(r"C:\Program Files"), PathBuf::from(r"C:\Program Files (x86)")]
+    }
+
+    #[test]
+    fn pdfcraft_still_matches_its_own_installer_name() {
+        let pdf = CraftApp::by_id("pdfcraft").unwrap();
+        assert!(is_installer_entry(pdf, "PdfCraft", LEARNING_MACHINES));
+    }
+
+    #[test]
+    fn printcraft_entries_match_nothing_else() {
+        let pdf = CraftApp::by_id("pdfcraft").unwrap();
+        assert!(!is_installer_entry(pdf, "PrintCraft", "Some Other Publisher"));
+        assert!(!is_installer_entry(pdf, "PhotoCraft", LEARNING_MACHINES));
+        for a in SUITE.iter().filter(|a| a.id != "pdfcraft") {
+            assert!(!is_installer_entry(a, "PrintCraft", LEARNING_MACHINES), "PrintCraft matched {}", a.name);
+        }
+    }
+
+    #[test]
+    fn apps_without_former_names_match_and_find_their_exe_as_before() {
+        let roots = roots();
+        let location = PathBuf::from(r"D:\Apps\Somewhere");
+        for a in SUITE.iter().filter(|a| a.id != "pdfcraft") {
+            assert!(is_installer_entry(a, a.name, LEARNING_MACHINES), "{}", a.name);
+            assert!(!is_installer_entry(a, a.name, "Some Other Publisher"), "{}", a.name);
+            assert!(!is_installer_entry(a, &a.name.to_lowercase(), LEARNING_MACHINES), "{}", a.name);
+            let exe = format!("{}.exe", a.id);
+            let in_program_files: Vec<PathBuf> = roots.iter().map(|r| r.join(a.name).join(&exe)).collect();
+            assert_eq!(exe_candidates(a, None, &roots), in_program_files);
+            let with_location: Vec<PathBuf> = std::iter::once(location.join(&exe)).chain(in_program_files).collect();
+            assert_eq!(exe_candidates(a, Some(&location), &roots), with_location);
+        }
     }
 }
