@@ -53,7 +53,9 @@ pub fn install(
     {
         return Err(format!("{} is running. Quit it, then try again.", app.name));
     }
+    log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
     let (file, verified) = download(release, asset, job)?;
+    log::info!("{}: download ready ({}), running installer...", app.name, file.display());
     // Past this point the install can't be interrupted halfway.
     (job.phase)(JobPhase::Installing);
     #[allow(unused_variables)]
@@ -74,6 +76,11 @@ pub fn install(
         PackageKind::TarGz => freebsd::install_tree(app, &file, job.paths).map(|(bin, files, root)| Some(record(&version, kind, bin, files, root))),
         other => Err(format!("{} isn't supported on this system", other.label())),
     };
+    match &result {
+        Ok(_) => log::info!("{}: successfully installed/updated to {}", app.name, release.version_label()),
+        Err(e) if e == CANCELLED => log::info!("{}: installation cancelled", app.name),
+        Err(e) => log::error!("{}: installation failed: {e}", app.name),
+    }
     if !keep_download(result.is_ok(), verified) {
         let _ = std::fs::remove_file(&file);
     }
@@ -489,16 +496,29 @@ pub(crate) mod linux {
         }
         match kind {
             PackageKind::Flatpak => {
-                let status = process::flatpak_command()
-                    .args(["install", "--user", "-y", "--noninteractive", "--bundle"])
-                    .arg(f)
-                    .status()
-                    .map_err(|e| format!("couldn't start Flatpak ({e})"))?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err("Flatpak couldn't install the bundle (it needs the Flathub remote for its runtime)".into())
-                }
+                let install_one = || {
+                    log::info!("executing flatpak install --reinstall --bundle for {}", file.display());
+                    let output = process::flatpak_command()
+                        .args(["install", "--user", "-y", "--noninteractive", "--reinstall", "--bundle"])
+                        .arg(f)
+                        .output()
+                        .map_err(|e| format!("couldn't start Flatpak ({e})"))?;
+                    if output.status.success() {
+                        log::info!("flatpak install succeeded for {}", file.display());
+                        Ok(())
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let err = stderr.trim();
+                        let err = if err.is_empty() { String::from_utf8_lossy(&output.stdout).trim().to_string() } else { err.to_string() };
+                        if err.is_empty() {
+                            Err("Flatpak couldn't install the bundle (it needs the Flathub remote for its runtime)".into())
+                        } else {
+                            let clean_err = err.strip_prefix("error: ").or_else(|| err.strip_prefix("Error: ")).unwrap_or(&err);
+                            Err(format!("Flatpak couldn't install the bundle: {clean_err}"))
+                        }
+                    }
+                };
+                root.queue.alone(&cancelled(stop), &mut turn(phase, JobPhase::Installing), install_one).unwrap_or(Err(CANCELLED.into()))
             }
             other => Err(format!("{} isn't a system package", other.label())),
         }
@@ -736,26 +756,39 @@ pub mod macos {
     /// `hdiutil create` too), since it turns concurrent requests away.
     pub(crate) static DISK_IMAGES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Apple's tools, by full path: a launcher started from Finder or at login gets a minimal
+    /// `PATH`, and nothing earlier on it should stand in for these.
+    const HDIUTIL: &str = "/usr/bin/hdiutil";
+    const DITTO: &str = "/usr/bin/ditto";
+    const CODESIGN: &str = "/usr/bin/codesign";
+
     pub fn install_dmg(app: &CraftApp, dmg: &Path, existing: Option<&Installed>, paths: &Paths, expect: &Expect<'_>) -> Result<PathBuf, String> {
-        let mount = paths.cache.join(format!("mount-{}", app.id));
-        let _ = detach(&mount);
-        std::fs::create_dir_all(&mount).map_err(|e| e.to_string())?;
-        let (Some(dmg_s), Some(mount_s)) = (dmg.to_str(), mount.to_str()) else { return Err("unusual characters in the cache folder's path".into()) };
+        // A new, empty mount point for every install. A fixed one can still hold an image from an
+        // attach that was interrupted or timed out, and hdiutil won't mount another over it.
+        let attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+        let mount = paths.cache.join(format!("mount-{}-{}-{attempt}", app.id, std::process::id()));
+        std::fs::create_dir_all(&mount).map_err(|e| format!("couldn't create a folder to open the disk image in ({e})"))?;
+        let (Some(dmg_s), Some(mount_s)) = (dmg.to_str(), mount.to_str()) else {
+            let _ = std::fs::remove_dir(&mount);
+            return Err("unusual characters in the cache folder's path".into());
+        };
         // diskimages-helper refuses an attach while it is busy with another image ("Resource
         // temporarily unavailable"): attach one image at a time (several apps may be updating at
         // once), and wait a little and try again when something outside the launcher holds it.
+        // The download's SHA-256 is already checked, so hdiutil's own checksum pass (-noverify)
+        // would only add minutes on a large image.
         let attached = {
             let _one_at_a_time = DISK_IMAGES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let attach = || {
-                process::capture(
-                    "hdiutil",
-                    &["attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mount_s, dmg_s],
-                    Duration::from_secs(120),
+                process::run(
+                    HDIUTIL,
+                    &["attach", "-nobrowse", "-readonly", "-noautoopen", "-noverify", "-mountpoint", mount_s, dmg_s],
+                    Duration::from_secs(300),
                 )
             };
             let mut attached = attach();
             for wait in [1, 2, 4, 8] {
-                if attached.is_some() {
+                if attached.is_ok() {
                     break;
                 }
                 let _ = detach(&mount);
@@ -764,7 +797,10 @@ pub mod macos {
             }
             attached
         };
-        attached.ok_or("couldn't open the disk image")?;
+        if let Err(reason) = attached {
+            let _ = std::fs::remove_dir(&mount);
+            return Err(format!("couldn't open the disk image: {reason}"));
+        }
         let result = copy_app(app, &mount, existing, expect);
         let _ = detach(&mount);
         let _ = std::fs::remove_dir(&mount);
@@ -784,8 +820,8 @@ pub mod macos {
         // metadata (com.apple.FinderInfo) to the files; leave it and the extended attributes
         // behind, or `codesign --verify --strict` rejects the bundle as carrying "detritus". A
         // bundle's signature lives in its files, not in extended attributes.
-        process::capture("ditto", &["--norsrc", "--noextattr", "--noacl", src_s, staged_s], Duration::from_secs(600))
-            .ok_or("couldn't copy the app")?;
+        process::run(DITTO, &["--norsrc", "--noextattr", "--noacl", src_s, staged_s], Duration::from_secs(600))
+            .map_err(|reason| format!("couldn't copy the app: {reason}"))?;
         let checked = crate::detect::macos::read_bundle(app, &staged)
             .ok_or_else(|| "the copied app is incomplete".to_string())
             .and_then(|found| check(&staged, &found, expect));
@@ -821,7 +857,7 @@ pub mod macos {
             return false;
         }
         let requirement = format!("=anchor apple generic and certificate leaf[subject.OU] = \"{team}\"");
-        process::capture("codesign", &["--verify", "--deep", "-R", &requirement, path], Duration::from_secs(120)).is_some()
+        process::capture(CODESIGN, &["--verify", "--deep", "-R", &requirement, path], Duration::from_secs(120)).is_some()
     }
 
     /// Whether a bundle's version is the release's. A bundle that reports only the numbers
@@ -835,8 +871,8 @@ pub mod macos {
         if !mount.join(".").exists() {
             return None;
         }
-        process::capture("hdiutil", &["detach", m, "-quiet"], Duration::from_secs(60))
-            .or_else(|| process::capture("hdiutil", &["detach", m, "-force", "-quiet"], Duration::from_secs(60)))
+        process::capture(HDIUTIL, &["detach", m, "-quiet"], Duration::from_secs(60))
+            .or_else(|| process::capture(HDIUTIL, &["detach", m, "-force", "-quiet"], Duration::from_secs(60)))
     }
 
     /// Moves an app to the user's Trash (so it can be put back).
@@ -1242,6 +1278,20 @@ mod tests {
         assert_eq!(ran.len(), 1, "{ran:?}");
         let error = "the system installer stopped with error 100 while handling 2 apps together. Try them one at a time.";
         assert_eq!(results, vec![Err(error.to_string()); 2]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flatpak_bundle_install_failure_reports_clean_error() {
+        if !crate::process::is_flatpak_available() {
+            return;
+        }
+        let queue = crate::queue::Queue::new();
+        let root = linux::Root { queue: &queue, run: &|_| Ok(()) };
+        let result = linux::install_package_via(&root, PackageKind::Flatpak, Path::new("/nonexistent/file.flatpak"), &Stop::default(), &mut |_| ());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.starts_with("Flatpak couldn't install the bundle: "), "unexpected error: {err}");
     }
 
     #[cfg(target_os = "linux")]
